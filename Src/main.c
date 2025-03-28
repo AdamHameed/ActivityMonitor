@@ -1,0 +1,728 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2025 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include <stdio.h> // For printf (if using UART for debugging)
+#include "step_counter.h"
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+/* USER CODE BEGIN PD */
+#define PMODACL2_CS_PIN GPIO_PIN_4
+#define PMODACL2_CS_PORT GPIOA
+
+// PmodACL2 Register Addresses
+#define PMODACL2_PART_ID         0x02  // Device ID
+#define PMODACL2_X_DATA          0x08  // X-axis data
+#define PMODACL2_Y_DATA          0x09  // Y-axis data
+#define PMODACL2_Z_DATA          0x0A  // Z-axis data
+#define PMODACL2_STATUS          0x0B  // Status register
+#define PMODACL2_XDATA_L         0x0E  // X-axis data low byte
+#define PMODACL2_XDATA_H         0x0F  // X-axis data high byte
+#define PMODACL2_YDATA_L         0x10  // Y-axis data low byte
+#define PMODACL2_YDATA_H         0x11  // Y-axis data high byte
+#define PMODACL2_ZDATA_L         0x12  // Z-axis data low byte
+#define PMODACL2_ZDATA_H         0x13  // Z-axis data high byte
+#define PMODACL2_POWER_CTL       0x2D  // Power control register
+volatile uint32_t currentState = 0;
+
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+SPI_HandleTypeDef hspi1;
+
+UART_HandleTypeDef huart3;
+
+PCD_HandleTypeDef hpcd_USB_OTG_FS;
+
+/* USER CODE BEGIN PV */
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_SPI1_Init(void);
+static void MX_USART3_UART_Init(void);
+static void MX_USB_OTG_FS_PCD_Init(void);
+/* USER CODE BEGIN PFP */
+void PmodACL2_CS_Low(void);
+void PmodACL2_CS_High(void);
+void PmodACL2_WriteRegister(uint8_t reg, uint8_t data);
+void PmodACL2_Init(void);
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+// Chip Select Control Functions
+StepCounterConfig step_config = {
+    .min_step_threshold = 1500,   // Adjust based on testing
+    .max_step_threshold = 5000,
+    .window_size = 5,
+    .step_delay_ms = 300,         // Min time between steps (ms)
+    .frequency_cutoff_hz = 5.0f,  // Cutoff for step frequencies
+    .sample_rate_hz = 50          // Must match your actual sample rate
+};
+
+void PmodACL2_CS_Low() {
+    HAL_GPIO_WritePin(PMODACL2_CS_PORT, PMODACL2_CS_PIN, GPIO_PIN_RESET);
+}
+
+void PmodACL2_CS_High() {
+    HAL_GPIO_WritePin(PMODACL2_CS_PORT, PMODACL2_CS_PIN, GPIO_PIN_SET);
+}
+
+void print_msg(char * msg) {
+  HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), 100);
+}
+
+
+void ReadFIFO(uint8_t *axis, int16_t *data) {
+    uint8_t txData = 0x0D;
+    uint8_t rxData[3] = {0};
+
+    PmodACL2_CS_Low();
+
+    if (HAL_SPI_Transmit(&hspi1, &txData, 1, HAL_MAX_DELAY) != HAL_OK) {
+        print_msg("SPI Transmit Error\n");
+        PmodACL2_CS_High();
+        return;
+    }
+
+    // Receive axis identifier and data (2 bytes)
+    if (HAL_SPI_Receive(&hspi1, rxData, 3, HAL_MAX_DELAY) != HAL_OK) {
+        print_msg("SPI Receive Error\n");
+        PmodACL2_CS_High(); // Deactivate CS
+        return;
+    }
+
+    PmodACL2_CS_High(); // Deactivate CS
+
+    // Print the received data
+
+    // Extract axis identifier and data
+    *axis = rxData[0]; // Axis identifier (b15 and b14)
+    *data = (int16_t)((rxData[1] << 8) | rxData[2]); // Combine LSB and MSB
+}
+void ConfigureFIFO() {
+    // Configure FIFO Control Register (0x28)
+    // Example: Set FIFO mode to "Stream" and enable storing X, Y, Z data
+    uint8_t fifoConfig = 0x80; // Example value (refer to datasheet for exact configuration)
+    PmodACL2_WriteRegister(0x28, fifoConfig);
+    print_msg("FIFO buffer configured.\n");
+}
+
+void PmodACL2_WriteRegister(uint8_t reg, uint8_t data) {
+    uint8_t txData[3] = {0x0A, reg, data};
+
+    PmodACL2_CS_Low();
+    HAL_SPI_Transmit(&hspi1, txData, 3, HAL_MAX_DELAY);
+    PmodACL2_CS_High();
+}
+
+void PmodACL2_Init() {
+    PmodACL2_WriteRegister(PMODACL2_POWER_CTL, 0x02);
+    HAL_Delay(100);
+}
+void PmodACL2_ReadRegister(uint8_t reg, uint8_t *data, uint8_t length) {
+    uint8_t txData[2] = {0x0B, reg};  // Read command and register address
+    uint8_t rxData[2 + length];  // Buffer for received data
+
+    PmodACL2_CS_Low();
+    HAL_SPI_TransmitReceive(&hspi1, txData, rxData, 2 + length, HAL_MAX_DELAY);
+    PmodACL2_CS_High();
+
+    // Copy received data to output buffer
+    for (uint8_t i = 0; i < length; i++) {
+        data[i] = rxData[i + 2];
+    }
+}
+
+void PmodACL2_CheckStatus() {
+    uint8_t status[1] = {0};
+    char message[100];
+    PmodACL2_ReadRegister(0x0B, status, 1);  // Read STATUS register
+//    sprintf(message, "STATUS: %d \n", status[0]&0x01);  // Should print 0x02 (measurement mode)
+//    print_msg(message);
+}
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+
+
+// PmodACL2 registers
+#define READ_COMMAND 0x0B  // Command to read from data registers
+#define Y_AXIS_ADDRESS 0x0A  // Address of the Y-axis data register
+
+// Function to read Y-axis data
+
+#define DEVID_AD 0x00      // Device ID register (should return 0xAD)
+#define DEVID_MST 0x01     // Device ID for MEMS (should return 0x1D)
+
+void PmodACL2_TestPowerCtl() {
+    uint8_t powerCtl[1] = {0};
+    char message[100];
+
+    // Read the POWER_CTL register
+    PmodACL2_ReadRegister(0x2D, powerCtl, 1);  // Read POWER_CTL register
+
+    // Format the message
+    sprintf(message, "POWER_CTL: 0x%02X\n", powerCtl[0]);
+
+    // Print the message
+    print_msg(message);
+}
+void PmodACL2_ResetFIFO() {
+    PmodACL2_WriteRegister(0x28, 0x00);  // FIFO_CTRL register, disable FIFO
+    HAL_Delay(10);  // Wait for the device to stabilize
+}
+
+#define FILTER_SIZE 10  // Number of samples for moving average filter
+int16_t xFilterBuffer[FILTER_SIZE] = {0};
+int filterIndex = 0;
+
+int16_t PmodACL2_ApplyMovingAverageFilter(int16_t newValue) {
+    // Add the new value to the buffer
+    xFilterBuffer[filterIndex] = newValue;
+    filterIndex = (filterIndex + 1) % FILTER_SIZE;
+
+    // Calculate the average
+    int32_t sum = 0;
+    for (int i = 0; i < FILTER_SIZE; i++) {
+        sum += xFilterBuffer[i];
+    }
+    return (int16_t)(sum / FILTER_SIZE);
+}
+
+void PmodACL2_step_8_bit_values(){
+  static uint16_t stepCount = 0;
+  static uint16_t possibleSteps = 0;
+  static float dynamicThreshold = 0.0f;
+  static const float sensitivity = 0.5f;
+  static float history[4] = {0};
+  static int historyIndex = 0;
+  static int state = 0;  // 0: looking for max, 1: looking for min
+  static float maxVal = 0.0f;
+  static float minVal = 0.0f;
+  static uint16_t consecutiveSteps = 0;
+  static uint16_t ticksSinceMax = 0;
+
+    int8_t xData = 0, yData = 0, zData = 0;
+    uint8_t status[1] = {0};
+    char message[100];
+    PmodACL2_ReadRegister(0x0B, status, 1); 
+
+    if (status[0] & 0x01) {
+		uint8_t xyzData[3] = {0};
+		PmodACL2_ReadRegister(0x08, xyzData, 3);
+
+		int8_t xData = (int8_t)xyzData[0];
+		int8_t yData = (int8_t)xyzData[1];
+		int8_t zData = (int8_t)xyzData[2];
+
+		float sumAbs = fabsf((float)xData) + fabsf((float)yData) + fabsf((float)zData);
+
+		history[historyIndex] = sumAbs;
+		historyIndex = (historyIndex + 1) % 4;
+		float filtered = 0.0f;
+		for(int i=0; i<4; i++){
+		  filtered += history[i];
+		}
+		filtered /= 4.0f;
+
+		// Peak detection
+		if(state == 0){
+		  if(filtered > maxVal){
+			maxVal = filtered;
+			ticksSinceMax = 0;
+		  }
+		  ticksSinceMax++;
+		  // Window check
+		  if(ticksSinceMax > 5){ // enough samples to confirm a peak
+			state = 1; // switch to minimum search
+			minVal = filtered;
+		  }
+		} else {
+		  if(filtered < minVal){
+			minVal = filtered;
+		  }
+
+		  if(++ticksSinceMax > 20){
+			float peakDiff = maxVal - minVal;
+			// Check dynamic threshold logic
+			float avgPeak = (maxVal + minVal) / 2.0f;
+			if(peakDiff > sensitivity){
+			  if(fabsf(avgPeak - dynamicThreshold) > sensitivity * 0.5f){
+				dynamicThreshold = (dynamicThreshold + avgPeak) / 2.0f;
+			  }
+
+			  if(maxVal > dynamicThreshold + (sensitivity * 0.5f) &&
+				 minVal < dynamicThreshold - (sensitivity * 0.5f)){
+				possibleSteps++;
+				if(possibleSteps >= 10){
+				  consecutiveSteps++;
+				  stepCount = stepCount + 1;
+				  sprintf(message, "%d\n", stepCount);
+				  print_msg(message);
+				}
+			  } else {
+				possibleSteps = 0;
+			  }
+			}
+			// Reset for next cycle
+			maxVal = filtered;
+			minVal = filtered;
+			ticksSinceMax = 0;
+			state = 0;
+		  }
+		}
+
+		// Use stepCount or print it as needed
+
+
+    }
+
+}
+
+
+void freefall(){
+	static int step_count = 0;
+    uint8_t status[1] = {0};
+    char message[100];
+    PmodACL2_ReadRegister(0x0B, status, 1);
+    
+
+    if (status[0] & 0x01) {
+      uint8_t xyzData[3] = {0};
+      PmodACL2_ReadRegister(0x08, xyzData, 3);
+
+      int8_t xValue = (int8_t)xyzData[0];
+      int8_t yValue = (int8_t)xyzData[1];
+      int8_t zValue = (int8_t)xyzData[2];
+
+      // Convert to real-world acceleration (g)
+      float xAcceleration = (float)xValue * 0.015625f;
+      float yAcceleration = (float)yValue * 0.015625f;
+      float zAcceleration = (float)zValue * 0.015625f;
+      
+      float magSquared = xAcceleration*xAcceleration + yAcceleration*yAcceleration + zAcceleration*zAcceleration;
+      
+      const float threshold_squared = 0.5f;
+      
+      // Check if magnitude squared is below threshold (indicating free fall)
+      if (magSquared < threshold_squared) {
+        HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_SET);
+//        print_msg("Free fall detected!\n");
+//        print_msg("step detected!\n");
+        step_count++;
+        sprintf(message, "%d/n", step_count);
+        print_msg(message);
+        HAL_Delay(100);
+      } else {
+        HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_RESET);
+      }
+      
+      char message[100];
+//      sprintf(message, "Accel magnitude: %.3f g\n", sqrtf(magSquared));
+//      print_msg(message);
+    }
+  
+}
+void CheckActivityTimeout(void) {
+    static uint32_t lastActivityTime = 0;
+    static float lastFilteredValue = 0;
+    const uint32_t inactivityTimeout = 5000;
+    uint8_t xyzData[3] = {0};
+    PmodACL2_ReadRegister(0x08, xyzData, 3);
+
+    int8_t xValue = (int8_t)xyzData[0];
+    int8_t yValue = (int8_t)xyzData[1];
+    int8_t zValue = (int8_t)xyzData[2];
+
+    // Convert to real-world acceleration (g)
+    float xAcceleration = (float)xValue * 0.015625f;
+    float yAcceleration = (float)yValue * 0.015625f;
+    float zAcceleration = (float)zValue * 0.015625f;
+
+    float magSquared = xAcceleration*xAcceleration + yAcceleration*yAcceleration + zAcceleration*zAcceleration;
+    float currentFiltered =  magSquared;
+
+    if(fabsf(currentFiltered - lastFilteredValue) > 1) {  // Activity detected
+        lastActivityTime = HAL_GetTick();
+        lastFilteredValue = currentFiltered;
+        HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, 0);
+    }
+    else if(HAL_GetTick() - lastActivityTime > inactivityTimeout) {
+    	HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_SET);
+    }
+}
+int main(void)
+{
+
+  /* USER CODE BEGIN 1 */
+  int8_t x, y, z;
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_SPI1_Init();
+  MX_USART3_UART_Init();
+  MX_USB_OTG_FS_PCD_Init();
+  PmodACL2_Init();
+  PmodACL2_ResetFIFO();
+  /* USER CODE BEGIN 2 */
+  // Initialize the PmodACL2
+//  PmodACL2_Init();
+
+//  PmodACL2_CS_Low();
+
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+//  ConfigureFIFO();
+  uint8_t axis;
+  int16_t data;
+
+  while (1)
+  {
+//	  ReadFIFO(&axis, &data);
+
+// Print axis and data
+//	  PmodACL2_StepCounting();
+//	  HAL_Delay(40);
+
+      switch(currentState) {
+          case 0:
+        	  PmodACL2_step_8_bit_values();
+              break;
+
+          case 1:
+        	  freefall();;
+              break;
+      }
+//	  PmodACL2_StepCounting();
+//	   freefall();
+//	   PmodACL2_step_8_bit_values();
+//	   CheckActivityTimeout();
+
+//	  PmodACL2_StepCounting();
+//	  PmodACL2_read_8_bit_values();
+    // Delay for readability
+	    HAL_Delay(20);
+  }
+  /* USER CODE END 3 */
+}
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  __HAL_RCC_PWR_CLK_ENABLE();
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 4;
+  RCC_OscInitStruct.PLL.PLLN = 168;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 7;
+  RCC_OscInitStruct.PLL.PLLR = 2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief SPI1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI1_Init(void)
+{
+
+  /* USER CODE BEGIN SPI1_Init 0 */
+
+  /* USER CODE END SPI1_Init 0 */
+
+  /* USER CODE BEGIN SPI1_Init 1 */
+
+  /* USER CODE END SPI1_Init 1 */
+  /* SPI1 parameter configuration*/
+  hspi1.Instance = SPI1;
+  hspi1.Init.Mode = SPI_MODE_MASTER;
+  hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi1.Init.NSS = SPI_NSS_SOFT;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_64;
+  hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi1.Init.CRCPolynomial = 10;
+  if (HAL_SPI_Init(&hspi1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI1_Init 2 */
+
+  /* USER CODE END SPI1_Init 2 */
+
+}
+
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
+  * @brief USB_OTG_FS Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USB_OTG_FS_PCD_Init(void)
+{
+
+  /* USER CODE BEGIN USB_OTG_FS_Init 0 */
+
+  /* USER CODE END USB_OTG_FS_Init 0 */
+
+  /* USER CODE BEGIN USB_OTG_FS_Init 1 */
+
+  /* USER CODE END USB_OTG_FS_Init 1 */
+  hpcd_USB_OTG_FS.Instance = USB_OTG_FS;
+  hpcd_USB_OTG_FS.Init.dev_endpoints = 6;
+  hpcd_USB_OTG_FS.Init.speed = PCD_SPEED_FULL;
+  hpcd_USB_OTG_FS.Init.dma_enable = DISABLE;
+  hpcd_USB_OTG_FS.Init.phy_itface = PCD_PHY_EMBEDDED;
+  hpcd_USB_OTG_FS.Init.Sof_enable = ENABLE;
+  hpcd_USB_OTG_FS.Init.low_power_enable = DISABLE;
+  hpcd_USB_OTG_FS.Init.lpm_enable = DISABLE;
+  hpcd_USB_OTG_FS.Init.vbus_sensing_enable = ENABLE;
+  hpcd_USB_OTG_FS.Init.use_dedicated_ep1 = DISABLE;
+  if (HAL_PCD_Init(&hpcd_USB_OTG_FS) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USB_OTG_FS_Init 2 */
+
+  /* USER CODE END USB_OTG_FS_Init 2 */
+
+}
+
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  /* USER CODE BEGIN MX_GPIO_Init_1 */
+
+  /* USER CODE END MX_GPIO_Init_1 */
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOG_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOB, LD1_Pin|LD3_Pin|LD2_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(USB_PowerSwitchOn_GPIO_Port, USB_PowerSwitchOn_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : USER_Btn_Pin */
+  GPIO_InitStruct.Pin = USER_Btn_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(USER_Btn_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PA4 */
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : LD1_Pin LD3_Pin LD2_Pin */
+  GPIO_InitStruct.Pin = LD1_Pin|LD3_Pin|LD2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : USB_PowerSwitchOn_Pin */
+  GPIO_InitStruct.Pin = USB_PowerSwitchOn_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(USB_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : USB_OverCurrent_Pin */
+  GPIO_InitStruct.Pin = USB_OverCurrent_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(USB_OverCurrent_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* USER CODE END MX_GPIO_Init_2 */
+}
+
+/* USER CODE BEGIN 4 */
+
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
