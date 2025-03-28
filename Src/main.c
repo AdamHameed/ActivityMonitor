@@ -209,22 +209,6 @@ void PmodACL2_ResetFIFO() {
     HAL_Delay(10);  // Wait for the device to stabilize
 }
 
-#define FILTER_SIZE 10  // Number of samples for moving average filter
-int16_t xFilterBuffer[FILTER_SIZE] = {0};
-int filterIndex = 0;
-
-int16_t PmodACL2_ApplyMovingAverageFilter(int16_t newValue) {
-    // Add the new value to the buffer
-    xFilterBuffer[filterIndex] = newValue;
-    filterIndex = (filterIndex + 1) % FILTER_SIZE;
-
-    // Calculate the average
-    int32_t sum = 0;
-    for (int i = 0; i < FILTER_SIZE; i++) {
-        sum += xFilterBuffer[i];
-    }
-    return (int16_t)(sum / FILTER_SIZE);
-}
 
 void PmodACL2_step_8_bit_values(){
   static uint16_t stepCount = 0;
@@ -308,8 +292,6 @@ void PmodACL2_step_8_bit_values(){
 			state = 0;
 		  }
 		}
-
-		// Use stepCount or print it as needed
 
 
     }
