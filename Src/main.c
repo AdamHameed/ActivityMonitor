@@ -21,7 +21,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdio.h> // For printf (if using UART for debugging)
+#include <string.h>  
+#include <stdlib.h> 
+#include <math.h> 
+#include <stdio.h>
 #include "step_counter.h"
 /* USER CODE END Includes */
 
@@ -49,7 +52,15 @@
 #define PMODACL2_ZDATA_L         0x12  // Z-axis data low byte
 #define PMODACL2_ZDATA_H         0x13  // Z-axis data high byte
 #define PMODACL2_POWER_CTL       0x2D  // Power control register
-volatile uint32_t currentState = 0;
+
+// breathing rate mode constants
+#define SAMPLE_INTERVAL 15  // for breathing rate mode: measure breathing rate every 15 seconds
+#define SAMPLING_RATE 2     // 2 samples per second
+#define MAX_SAMPLES (SAMPLE_INTERVAL * SAMPLING_RATE)
+
+volatile current_state_t previousState = STATE_IDLE;
+volatile current_state_t currentState = STATE_IDLE;
+uint32_t lastActivityTime = 0;
 
 /* USER CODE END PD */
 
@@ -80,18 +91,25 @@ void PmodACL2_CS_Low(void);
 void PmodACL2_CS_High(void);
 void PmodACL2_WriteRegister(uint8_t reg, uint8_t data);
 void PmodACL2_Init(void);
+float estimate_breathing_rate(float *vertical_accel, int length);
+void reset_velocity();
+void estimate_velocity();
+void calibrate_offset();
+void play_balancing_game();
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
 // Chip Select Control Functions
 StepCounterConfig step_config = {
-    .min_step_threshold = 1500,   // Adjust based on testing
+    .min_step_threshold = 1500,
     .max_step_threshold = 5000,
     .window_size = 5,
-    .step_delay_ms = 300,         // Min time between steps (ms)
-    .frequency_cutoff_hz = 5.0f,  // Cutoff for step frequencies
-    .sample_rate_hz = 50          // Must match your actual sample rate
+    .step_delay_ms = 300,
+    .frequency_cutoff_hz = 5.0f,
+    .sample_rate_hz = 50
 };
 
 void PmodACL2_CS_Low() {
@@ -105,7 +123,6 @@ void PmodACL2_CS_High() {
 void print_msg(char * msg) {
   HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), 100);
 }
-
 
 void ReadFIFO(uint8_t *axis, int16_t *data) {
     uint8_t txData = 0x0D;
@@ -128,16 +145,13 @@ void ReadFIFO(uint8_t *axis, int16_t *data) {
 
     PmodACL2_CS_High(); // Deactivate CS
 
-    // Print the received data
-
-    // Extract axis identifier and data
     *axis = rxData[0]; // Axis identifier (b15 and b14)
     *data = (int16_t)((rxData[1] << 8) | rxData[2]); // Combine LSB and MSB
 }
 void ConfigureFIFO() {
-    // Configure FIFO Control Register (0x28)
-    // Example: Set FIFO mode to "Stream" and enable storing X, Y, Z data
-    uint8_t fifoConfig = 0x80; // Example value (refer to datasheet for exact configuration)
+    // FIFO Register is 0x28
+    // Set FIFO mode to "Stream", store X, Y, Z data
+    uint8_t fifoConfig = 0x80; 
     PmodACL2_WriteRegister(0x28, fifoConfig);
     print_msg("FIFO buffer configured.\n");
 }
@@ -172,7 +186,7 @@ void PmodACL2_CheckStatus() {
     uint8_t status[1] = {0};
     char message[100];
     PmodACL2_ReadRegister(0x0B, status, 1);  // Read STATUS register
-//    sprintf(message, "STATUS: %d \n", status[0]&0x01);  // Should print 0x02 (measurement mode)
+//    sprintf(message, "STATUS: %d \n", status[0]&0x01);
 //    print_msg(message);
 }
 
@@ -183,13 +197,13 @@ void PmodACL2_CheckStatus() {
 
 
 // PmodACL2 registers
-#define READ_COMMAND 0x0B  // Command to read from data registers
-#define Y_AXIS_ADDRESS 0x0A  // Address of the Y-axis data register
+#define READ_COMMAND 0x0B  // read from data registers
+#define Y_AXIS_ADDRESS 0x0A  // Address of Y-axis data register
 
 // Function to read Y-axis data
 
-#define DEVID_AD 0x00      // Device ID register (should return 0xAD)
-#define DEVID_MST 0x01     // Device ID for MEMS (should return 0x1D)
+#define DEVID_AD 0x00      // Device ID register (expected: 0xAD)
+#define DEVID_MST 0x01     // Device ID for MEMS (expected: 0x1D)
 
 void PmodACL2_TestPowerCtl() {
     uint8_t powerCtl[1] = {0};
@@ -204,24 +218,58 @@ void PmodACL2_TestPowerCtl() {
     // Print the message
     print_msg(message);
 }
-void PmodACL2_ResetFIFO() {
-    PmodACL2_WriteRegister(0x28, 0x00);  // FIFO_CTRL register, disable FIFO
-    HAL_Delay(10);  // Wait for the device to stabilize
+
+void PmodACL2_ConfigureShakeInterrupt() {
+    PmodACL2_WriteRegister(0x20, 0xFA); 
+    PmodACL2_WriteRegister(0x21, 0x00);
+	
+    // inactivity threshold to 150 mg
+    PmodACL2_WriteRegister(0x23, 0x96); 
+	
+    // inactivity timer to 30 samples
+    PmodACL2_WriteRegister(0x25, 0x1E);
+	
+    // activity/inactivity detection
+		PmodACL2_WriteRegister(0x27, 0x3F); 
+	
+    // connect the awake signal to INT1 pin
+    PmodACL2_WriteRegister(0x2A, 0x40);
 }
 
 
-void PmodACL2_step_8_bit_values(){
-  static uint16_t stepCount = 0;
-  static uint16_t possibleSteps = 0;
-  static float dynamicThreshold = 0.0f;
-  static const float sensitivity = 0.5f;
-  static float history[4] = {0};
-  static int historyIndex = 0;
-  static int state = 0;  // 0: looking for max, 1: looking for min
-  static float maxVal = 0.0f;
-  static float minVal = 0.0f;
-  static uint16_t consecutiveSteps = 0;
-  static uint16_t ticksSinceMax = 0;
+void PmodACL2_ResetFIFO() {
+    PmodACL2_WriteRegister(0x28, 0x00);  // FIFO_CTRL register, disable FIFO
+    HAL_Delay(10);
+}
+
+void PmodACL2_get_acceleration(float *xAccel, float *yAccel, float *zAccel) {
+    uint8_t xyzData[3] = {0};
+    PmodACL2_ReadRegister(0x08, xyzData, 3);
+
+    *xAccel = ((int8_t)xyzData[0]) * 0.015625f;
+    *yAccel = ((int8_t)xyzData[1]) * 0.015625f;
+    *zAccel = ((int8_t)xyzData[2]) * 0.015625f;
+}
+
+void PmodACL2_step_8_bit_values() {
+    // step counting
+    static uint16_t stepCount = 0;
+    static uint16_t possibleSteps = 0;
+    static float dynamicThreshold = 0.0f;
+    static const float sensitivity = 0.5f;
+    static float history[4] = {0};
+    static int historyIndex = 0;
+    static int state = 0;
+    static float maxVal = 0.0f;
+    static float minVal = 0.0f;
+    static uint16_t ticksSinceMax = 0;
+    static uint16_t consecutiveSteps = 0;
+
+    // calorie estimation
+    static float totalCalories = 0.0f;
+    static float lastUpdateTime = 0.0f;
+    const float MET_WALKING = 3.5f;  // metabolic equivalent for walking
+    const float USER_WEIGHT_KG = 60.0f;
 
     int8_t xData = 0, yData = 0, zData = 0;
     uint8_t status[1] = {0};
@@ -229,75 +277,69 @@ void PmodACL2_step_8_bit_values(){
     PmodACL2_ReadRegister(0x0B, status, 1); 
 
     if (status[0] & 0x01) {
-		uint8_t xyzData[3] = {0};
-		PmodACL2_ReadRegister(0x08, xyzData, 3);
+        uint8_t xyzData[3] = {0};
+        PmodACL2_ReadRegister(0x08, xyzData, 3);
 
-		int8_t xData = (int8_t)xyzData[0];
-		int8_t yData = (int8_t)xyzData[1];
-		int8_t zData = (int8_t)xyzData[2];
+        int8_t xData = (int8_t)xyzData[0];
+        int8_t yData = (int8_t)xyzData[1];
+        int8_t zData = (int8_t)xyzData[2];
 
-		float sumAbs = fabsf((float)xData) + fabsf((float)yData) + fabsf((float)zData);
+        float sumAbs = fabsf((float)xData) + fabsf((float)yData) + fabsf((float)zData);
 
-		history[historyIndex] = sumAbs;
-		historyIndex = (historyIndex + 1) % 4;
-		float filtered = 0.0f;
-		for(int i=0; i<4; i++){
-		  filtered += history[i];
-		}
-		filtered /= 4.0f;
+        history[historyIndex] = sumAbs;
+        historyIndex = (historyIndex + 1) % 4;
+        float filtered = 0.0f;
+        for(int i=0; i<4; i++) filtered += history[i];
+        filtered /= 4.0f;
 
-		// Peak detection
-		if(state == 0){
-		  if(filtered > maxVal){
-			maxVal = filtered;
-			ticksSinceMax = 0;
-		  }
-		  ticksSinceMax++;
-		  // Window check
-		  if(ticksSinceMax > 5){ // enough samples to confirm a peak
-			state = 1; // switch to minimum search
-			minVal = filtered;
-		  }
-		} else {
-		  if(filtered < minVal){
-			minVal = filtered;
-		  }
-
-		  if(++ticksSinceMax > 20){
-			float peakDiff = maxVal - minVal;
-			// Check dynamic threshold logic
-			float avgPeak = (maxVal + minVal) / 2.0f;
-			if(peakDiff > sensitivity){
-			  if(fabsf(avgPeak - dynamicThreshold) > sensitivity * 0.5f){
-				dynamicThreshold = (dynamicThreshold + avgPeak) / 2.0f;
-			  }
-
-			  if(maxVal > dynamicThreshold + (sensitivity * 0.5f) &&
-				 minVal < dynamicThreshold - (sensitivity * 0.5f)){
-				possibleSteps++;
-				if(possibleSteps >= 10){
-				  consecutiveSteps++;
-				  stepCount = stepCount + 1;
-				  sprintf(message, "%d\n", stepCount);
-				  print_msg(message);
-				}
-			  } else {
-				possibleSteps = 0;
-			  }
-			}
-			// Reset for next cycle
-			maxVal = filtered;
-			minVal = filtered;
-			ticksSinceMax = 0;
-			state = 0;
-		  }
-		}
-
-
+        // Peak detection
+        if(state == 0) {
+            if(filtered > maxVal) {
+                maxVal = filtered;
+                ticksSinceMax = 0;
+            }
+            ticksSinceMax++;
+            if(ticksSinceMax > 5) {
+                state = 1;
+                minVal = filtered;
+            }
+        } else {
+            if(filtered < minVal) minVal = filtered;
+            if(++ticksSinceMax > 20) {
+                float peakDiff = maxVal - minVal;
+                float avgPeak = (maxVal + minVal) / 2.0f;
+                if(peakDiff > sensitivity) {
+                    if(fabsf(avgPeak - dynamicThreshold) > sensitivity * 0.5f) {
+                        dynamicThreshold = (dynamicThreshold + avgPeak) / 2.0f;
+                    }
+                    if(maxVal > dynamicThreshold + (sensitivity * 0.5f) &&
+                       minVal < dynamicThreshold - (sensitivity * 0.5f)) {
+                        possibleSteps++;
+                        if(possibleSteps >= 10) {
+                            consecutiveSteps++;
+                            stepCount++;
+                            
+                            // calorie calculation
+                            // - 1 step ˜ = 0.75 meters
+                            // - calories = MET * weight_kg * time_hours
+                            // 100 steps ˜~= 0.5 calories
+                            totalCalories += USER_WEIGHT_KG * 0.0005f;
+                            
+                            sprintf(message, "Steps: %d | Calories: %.2f\n", stepCount, totalCalories);
+                            print_msg(message);
+                        }
+                    } else {
+                        possibleSteps = 0;
+                    }
+                }
+                maxVal = filtered;
+                minVal = filtered;
+                ticksSinceMax = 0;
+                state = 0;
+            }
+        }
     }
-
 }
-
 
 void freefall(){
 	static int step_count = 0;
@@ -307,45 +349,38 @@ void freefall(){
     
 
     if (status[0] & 0x01) {
-      uint8_t xyzData[3] = {0};
-      PmodACL2_ReadRegister(0x08, xyzData, 3);
-
-      int8_t xValue = (int8_t)xyzData[0];
-      int8_t yValue = (int8_t)xyzData[1];
-      int8_t zValue = (int8_t)xyzData[2];
-
-      // Convert to real-world acceleration (g)
-      float xAcceleration = (float)xValue * 0.015625f;
-      float yAcceleration = (float)yValue * 0.015625f;
-      float zAcceleration = (float)zValue * 0.015625f;
+      float xAcceleration;
+      float yAcceleration;
+      float zAcceleration;
+			PmodACL2_get_acceleration(&xAcceleration, &yAcceleration, &zAcceleration);
       
       float magSquared = xAcceleration*xAcceleration + yAcceleration*yAcceleration + zAcceleration*zAcceleration;
       
-      const float threshold_squared = 0.5f;
+      const float threshold_squared = 0.1f;
       
-      // Check if magnitude squared is below threshold (indicating free fall)
+      // Check if magnitude squared is below threshold
       if (magSquared < threshold_squared) {
         HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_SET);
-//        print_msg("Free fall detected!\n");
-//        print_msg("step detected!\n");
+        print_msg("Free fall detected!\n");
         step_count++;
-        sprintf(message, "%d/n", step_count);
-        print_msg(message);
-        HAL_Delay(100);
+        //sprintf(message, "%d\n", step_count);
+        //print_msg(message);
+        //HAL_Delay(100);
       } else {
         HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_RESET);
       }
-      
+
       char message[100];
 //      sprintf(message, "Accel magnitude: %.3f g\n", sqrtf(magSquared));
 //      print_msg(message);
     }
   
 }
+
+
 void CheckActivityTimeout(void) {
-    static uint32_t lastActivityTime = 0;
     static float lastFilteredValue = 0;
-    const uint32_t inactivityTimeout = 5000;
+    const uint32_t inactivityTimeout = 10000;
     uint8_t xyzData[3] = {0};
     PmodACL2_ReadRegister(0x08, xyzData, 3);
 
@@ -367,9 +402,125 @@ void CheckActivityTimeout(void) {
         HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, 0);
     }
     else if(HAL_GetTick() - lastActivityTime > inactivityTimeout) {
-    	HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_SET);
+			// GO TO SLEEP
+			reset_velocity();
+    	currentState = STATE_IDLE;
     }
 }
+
+
+void enter_sleep_mode(void) {
+    HAL_SPI_DeInit(&hspi1);
+    HAL_UART_DeInit(&huart3);
+    __HAL_RCC_SPI1_CLK_DISABLE();
+    __HAL_RCC_USART3_CLK_DISABLE();
+    
+    HAL_PWR_EnableWakeUpPin(PWR_WAKEUP_PIN2);
+    __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_2);
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+	
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
+
+    // disable LED GPIOs
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_0);
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_1);
+
+    __HAL_RCC_GPIOB_CLK_DISABLE();
+    __HAL_RCC_SPI1_CLK_DISABLE();
+    __HAL_RCC_USART3_CLK_DISABLE();
+	
+		HAL_SuspendTick();
+    HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI); // blocks here
+    HAL_ResumeTick();
+		
+    // wakeup
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_SPI1_Init();
+    MX_USART3_UART_Init();
+    PmodACL2_Init();
+    PmodACL2_ConfigureShakeInterrupt();
+    
+    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
+		currentState = STATE_PASSIVE; 
+		lastActivityTime = HAL_GetTick(); 
+}
+
+
+void breathing_mode() {
+    static float acc_z[MAX_SAMPLES];
+    static int sample_index = 0;
+    static int isCalibrating = 1;
+    static uint32_t lastSampleTime = 0;
+    char message[100];
+
+    uint32_t currentTime = HAL_GetTick();
+
+    if (currentTime - lastSampleTime >= 500) {  
+        lastSampleTime = currentTime;
+
+        float xAccel, yAccel, zAccel;
+        PmodACL2_get_acceleration(&xAccel, &yAccel, &zAccel);
+				
+				// populate our sample buffer
+        acc_z[sample_index] = zAccel;
+        sample_index++;
+
+				// while we're sampling, print a message for more clarity
+        if (isCalibrating) {
+            print_msg("Calibrating breathing rate....\n");
+            isCalibrating = 0;
+        }
+
+				// once we get enough samples, we pass it into our estimation function
+				// which smoothes the data for denoising and counts peaks
+        if (sample_index >= MAX_SAMPLES) {
+            float bpm = estimate_breathing_rate(acc_z, MAX_SAMPLES);
+            sprintf(message, "Breathing Rate: %.2f BPM\n", bpm);
+            print_msg(message);
+            isCalibrating = 1;
+            sample_index = 0;
+        }
+    }
+}
+
+
+volatile uint8_t accelInterruptFlag = 0;
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    if (GPIO_Pin == GPIO_PIN_2) {
+        accelInterruptFlag = 1;
+        HAL_GPIO_TogglePin(LD1_GPIO_Port, LD1_Pin);
+        //print_msg("INT1 detected\n");
+    }
+}
+
+void print_state_message(current_state_t state) {
+    switch (state) {
+        case STATE_PASSIVE:
+            print_msg("[MODE] Passive\n");
+						print_msg("[+] Step counting, fall detection, calorie tracking enabled\n");
+            break;
+        case STATE_IDLE:
+            print_msg("[MODE] Idle\n");
+            break;
+				case STATE_BALANCE:
+						print_msg("[MODE] Balancing Game\n");
+						break;
+				case STATE_VELOCITY:
+						print_msg("[MODE] Velocity Measurement\n");
+						break;
+				case STATE_BREATH:
+						print_msg("[MODE] Breathing Rate Measurement\n");
+						break;
+        default:
+            print_msg("[MODE] Unknown State\n");
+            break;
+    }
+}
+
+
 int main(void)
 {
 
@@ -400,6 +551,7 @@ int main(void)
   MX_USB_OTG_FS_PCD_Init();
   PmodACL2_Init();
   PmodACL2_ResetFIFO();
+	
   /* USER CODE BEGIN 2 */
   // Initialize the PmodACL2
 //  PmodACL2_Init();
@@ -411,44 +563,53 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 //  ConfigureFIFO();
+/* In main() (before while-loop) */
+	HAL_NVIC_SetPriority(EXTI2_IRQn, 0, 0);
+	HAL_NVIC_EnableIRQ(EXTI2_IRQn);
+	PmodACL2_ConfigureShakeInterrupt();
+	calibrate_offset();
   uint8_t axis;
   int16_t data;
 
   while (1)
   {
-//	  ReadFIFO(&axis, &data);
-
-// Print axis and data
-//	  PmodACL2_StepCounting();
-//	  HAL_Delay(40);
-
+		
+		if (currentState != previousState) {
+				print_state_message(currentState);
+        previousState = currentState;  
+    }
+		
       switch(currentState) {
-          case 0:
+					case STATE_IDLE:
+						enter_sleep_mode();
+						// executes here after wakeup
+						break;
+					case STATE_PASSIVE:
         	  PmodACL2_step_8_bit_values();
-              break;
-
-          case 1:
-        	  freefall();;
-              break;
+						freefall();
+						CheckActivityTimeout();
+             break;
+					case STATE_BREATH:
+						breathing_mode();
+						//CheckActivityTimeout();
+						break;
+					case STATE_BALANCE:
+						//print_msg("Balance game starting in 5 seconds...\n");
+						//HAL_Delay(5000);
+						play_balancing_game();
+						//CheckActivityTimeout();
+						break;
+					case STATE_VELOCITY:
+						estimate_velocity();
+						CheckActivityTimeout();
       }
-//	  PmodACL2_StepCounting();
-//	   freefall();
-//	   PmodACL2_step_8_bit_values();
-//	   CheckActivityTimeout();
-
-//	  PmodACL2_StepCounting();
-//	  PmodACL2_read_8_bit_values();
     // Delay for readability
-	    HAL_Delay(20);
+	    HAL_Delay(50);
   }
   /* USER CODE END 3 */
 }
 /* USER CODE END 0 */
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
 
 /**
   * @brief System Clock Configuration
@@ -616,6 +777,7 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
@@ -636,6 +798,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(USER_Btn_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : PF2 */
+  GPIO_InitStruct.Pin = GPIO_PIN_2;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PA4 */
   GPIO_InitStruct.Pin = GPIO_PIN_4;
@@ -665,6 +833,9 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(USB_OverCurrent_GPIO_Port, &GPIO_InitStruct);
 
   /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI2_IRQn);
+
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
