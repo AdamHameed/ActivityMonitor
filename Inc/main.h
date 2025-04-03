@@ -31,7 +31,8 @@ extern "C" {
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-extern volatile uint32_t currentState;
+typedef enum {STATE_IDLE, STATE_PASSIVE, STATE_VELOCITY, STATE_BREATH, STATE_BALANCE} current_state_t;
+extern volatile current_state_t currentState;
 /* USER CODE END Includes */
 
 /* Exported types ------------------------------------------------------------*/
