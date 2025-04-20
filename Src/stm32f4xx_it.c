@@ -31,7 +31,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define DEBOUNCE_DELAY_MS 50
+static uint32_t last_button_press = 0;
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -199,21 +200,48 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /**
+  * @brief This function handles EXTI line 2 interrupt.
+  */
+void EXTI2_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI2_IRQn 0 */
+
+  /* USER CODE END EXTI2_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_2);
+  /* USER CODE BEGIN EXTI2_IRQn 1 */
+
+  /* USER CODE END EXTI2_IRQn 1 */
+}
+
+/**
   * @brief This function handles EXTI line[15:10] interrupts.
   */
 void EXTI15_10_IRQHandler(void)
 {
   /* USER CODE BEGIN EXTI15_10_IRQn 0 */
-	  if (__HAL_GPIO_EXTI_GET_FLAG(USER_Btn_Pin)) {
-		  	  if (__HAL_GPIO_EXTI_GET_FLAG(USER_Btn_Pin)) {
-
-		  		  HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-
-		  	      __HAL_GPIO_EXTI_CLEAR_FLAG(USER_Btn_Pin);
-		    }
-	  }
-	  currentState = (currentState + 1)%2;
-
+  if (__HAL_GPIO_EXTI_GET_FLAG(USER_Btn_Pin)) {
+    uint32_t now = HAL_GetTick();
+    // debounce
+    if ((now - last_button_press) > DEBOUNCE_DELAY_MS) {
+      last_button_press = now;
+      
+      // led 2
+      HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+      if (HAL_GPIO_ReadPin(USER_Btn_GPIO_Port, USER_Btn_Pin) == GPIO_PIN_RESET) {
+        // button pressed
+      } else {
+        // button released - change state
+        if (currentState == STATE_IDLE) {
+          currentState = STATE_PASSIVE;
+        } else {
+          // only allow mode switching when not idle
+					currentState = (currentState == STATE_BALANCE) ? STATE_PASSIVE : (currentState + 1);
+        }
+      }
+    }
+    
+    __HAL_GPIO_EXTI_CLEAR_FLAG(USER_Btn_Pin);
+  }
   /* USER CODE END EXTI15_10_IRQn 0 */
   HAL_GPIO_EXTI_IRQHandler(USER_Btn_Pin);
   /* USER CODE BEGIN EXTI15_10_IRQn 1 */
